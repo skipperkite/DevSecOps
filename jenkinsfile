@@ -1,112 +1,146 @@
 pipeline {
     agent any
-    tools {
-        jdk 'jdk17'                       // ✅ Confirmed: tool name for Java
-        nodejs 'node23'                   // ✅ Confirmed: tool name for Node.js
-    }
+
     environment {
-        SCANNER_HOME = tool 'sonar-scanner'  // ✅ Confirmed: SonarScanner tool name
+        SCANNER_HOME = tool 'sonar-scanner'
     }
+
     stages {
+
         stage("Clean Workspace") {
             steps {
                 cleanWs()
             }
         }
-        stage("Git Checkout") {
+
+        stage("Checkout Code") {
             steps {
                 git 'https://github.com/skipperkite/DevOps-Project-Zomato-Kastro.git'
             }
         }
-        stage("Sonarqube Analysis") {
+
+        stage("Secrets Leak Check (Gitleaks)") {
             steps {
-                withSonarQubeEnv('sonar-server') {  // ✅ Confirmed: system name for SonarQube server
+                sh 'gitleaks detect --source . --report-format sarif --report-path gitleaks.sarif || true'
+            }
+        }
+
+        stage("Install Node Dependencies") {
+            steps {
+                sh 'npm ci'
+            }
+        }
+
+        stage("Unit Testing") {
+            steps {
+                sh 'npm test'
+            }
+        }
+
+        stage("SonarQube Analysis") {
+            steps {
+                withSonarQubeEnv('sonar-server') {
                     sh '''$SCANNER_HOME/bin/sonar-scanner \
-                    -Dsonar.projectName=zomato \
-                    -Dsonar.projectKey=zomato'''
+                        -Dsonar.projectKey=zomato \
+                        -Dsonar.projectName=zomato'''
                 }
             }
         }
-        stage("Code Quality Gate") {
+
+        stage("Sonar Quality Gate") {
             steps {
                 script {
-                    waitForQualityGate abortPipeline: false, credentialsId: 'sonar-scanner-id' // 🔄 Changed from 'Sonar-token'
+                    waitForQualityGate abortPipeline: true, credentialsId: 'sonar-scanner-id'
                 }
             }
         }
-        stage("Install NPM Dependencies") {
+
+        stage("OWASP Dependency Check") {
             steps {
-                sh "npm install"
-            }
-        }
-        stage("OWASP FS SCAN") {
-            steps {
-                dependencyCheck additionalArguments: '--scan ./ --disableYarnAudit --disableNodeAudit -n', odcInstallation: 'DP-Check' // ✅ Confirmed: OWASP tool name
+                dependencyCheck additionalArguments: '--scan ./ --project ZomatoApp -n --format HTML', odcInstallation: 'DP-Check'
                 dependencyCheckPublisher pattern: '**/dependency-check-report.xml'
             }
         }
-        stage("Trivy File Scan") {
+
+        stage("Dockerfile Scan (Hadolint)") {
             steps {
-                sh "trivy fs . > trivy.txt"
+                sh 'hadolint Dockerfile || true'
             }
         }
+
         stage("Build Docker Image") {
             steps {
-                sh "docker build -t zomato ."
+                sh 'docker build -t zomato .'
             }
         }
-        stage("Tag & Push to DockerHub") {
+
+        stage("Trivy Scan (Docker Image)") {
+            steps {
+                sh 'trivy image zomato > trivy-image.txt || true'
+            }
+        }
+
+        stage("Smoke Test (Docker Container)") {
+            steps {
+                sh '''
+                docker run -d --rm --name zomato-smoke -p 3000:3000 zomato
+                sleep 10
+                curl --fail http://localhost:3000 || (echo "❌ Smoke test failed" && exit 1)
+                docker stop zomato-smoke
+                '''
+            }
+        }
+
+        stage("Push to DockerHub") {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker-cred') { // 🔄 Changed from 'docker'
-                        sh "docker tag zomato saisaravana/zomato:latest" // 🔄 Replaced DockerHub username
-                        sh "docker push saisaravana/zomato:latest"       // 🔄 Replaced DockerHub username
+                    withDockerRegistry(credentialsId: 'docker-cred') {
+                        sh '''
+                        docker tag zomato saisaravana/zomato:latest
+                        docker push saisaravana/zomato:latest
+                        '''
                     }
                 }
             }
         }
-        stage("Docker Scout Image") {
+
+        stage("Docker Scout Insights") {
             steps {
                 script {
-                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') { // 🔄 Changed from 'docker'
-                        sh 'docker-scout quickview saisaravana/zomato:latest'             // 🔄 DockerHub username
-                        sh 'docker-scout cves saisaravana/zomato:latest'                  // 🔄 DockerHub username
-                        sh 'docker-scout recommendations saisaravana/zomato:latest'       // 🔄 DockerHub username
+                    withDockerRegistry(credentialsId: 'docker-cred', toolName: 'docker') {
+                        sh '''
+                        docker-scout quickview saisaravana/zomato:latest
+                        docker-scout cves saisaravana/zomato:latest
+                        docker-scout recommendations saisaravana/zomato:latest
+                        '''
                     }
                 }
             }
         }
+
         stage("Deploy to Container") {
             steps {
-                sh 'docker run -d --name zomato -p 3000:3000 saisaravana/zomato:latest' // 🔄 DockerHub username
+                sh 'docker run -d --name zomato -p 3000:3000 saisaravana/zomato:latest'
             }
         }
     }
+
     post {
         always {
-            emailext (
-                attachLog: true,
-                subject: "'${currentBuild.result}'",
+            emailext(
+                subject: "'${currentBuild.result}' for Job: ${env.JOB_NAME} [#${env.BUILD_NUMBER}]",
                 body: """
                     <html>
-                    <body>
-                        <div style="background-color: #FFA07A; padding: 10px; margin-bottom: 10px;">
-                            <p style="color: white; font-weight: bold;">Project: ${env.JOB_NAME}</p>
-                        </div>
-                        <div style="background-color: #90EE90; padding: 10px; margin-bottom: 10px;">
-                            <p style="color: white; font-weight: bold;">Build Number: ${env.BUILD_NUMBER}</p>
-                        </div>
-                        <div style="background-color: #87CEEB; padding: 10px; margin-bottom: 10px;">
-                            <p style="color: white; font-weight: bold;">URL: ${env.BUILD_URL}</p>
-                        </div>
-                    </body>
+                      <body>
+                        <p><strong>Job:</strong> ${env.JOB_NAME}</p>
+                        <p><strong>Build #:</strong> ${env.BUILD_NUMBER}</p>
+                        <p><strong>Result:</strong> ${currentBuild.result}</p>
+                        <p><strong>Link:</strong> <a href='${env.BUILD_URL}'>View Build</a></p>
+                      </body>
                     </html>
                 """,
-                to: 'ssaissaravana@gmail.com',         // ✅ Email recipient
-                replyTo: 'ssaissaravana@gmail.com',     // ✅ Reply-to address
-                from: 'ssaissaravana@gmail.com',        // ✅ Sender address
                 mimeType: 'text/html',
-                attachmentsPattern: 'trivy.txt'
+                to: 'ssaissaravana@gmail.com'
             )
         }
     }
