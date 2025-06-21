@@ -15,7 +15,7 @@ pipeline {
 
         stage("Checkout Code") {
             steps {
-                git 'https://github.com/skipperkite/DevOps-Project-Zomato-Kastro.git'
+                git 'https://github.com/skipperkite/DevSecOps.git'
             }
         }
 
